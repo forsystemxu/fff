@@ -4,11 +4,12 @@ import logging
 import time
 from datetime import datetime
 
-from appium import webdriver  # Appium drives the Android browser
+from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -18,33 +19,24 @@ logging.basicConfig(
 
 
 class FastRegistrationTester:
-    """专为 **华为浏览器** 预设的快速注册自动化脚本。
-
-    ▶ 默认包名 `com.huawei.browser`
-    ▶ 默认主 Activity `com.huawei.browser.BrowserActivity`
-
-    只需安装 Appium‑Server、匹配版本的 chromedriver，并连上开启 USB 调试的华为/荣耀手机即可运行。
+    """A leaner, faster version of the registration tester that now waits
+    for a 4‑digit verification code before clicking the Register button.
+    The code field is polled once per second, for up to ``CODE_INPUT_TIMEOUT``
+    seconds. Adjust ``CODE_FIELD_ID`` below if your page uses a different
+    element ID or a CSS selector.
     """
 
-    DEFAULT_TIMEOUT = 10         # 显式等待秒数
-    POLL_FREQUENCY = 0.3         # WebDriverWait 轮询间隔
-    CODE_LEN = 4                 # 验证码位数
-    MAX_CODE_WAIT = 300          # 最多等待验证码秒数
+    # ------------------------------------------------------------------
+    # Global settings
+    # ------------------------------------------------------------------
+    DEFAULT_TIMEOUT = 10           # seconds for explicit waits
+    POLL_FREQUENCY = 0.3           # seconds for WebDriverWait polling
+    CODE_INPUT_TIMEOUT = 120       # seconds to wait for a 4‑digit code
+    CODE_FIELD_ID = "register-code"  # ID of the verification‑code <input>
 
-    def __init__(
-        self,
-        url: str = "https://node1.much-ai.com",
-        headless: bool = False,
-        browser_package: str = "com.huawei.browser",
-        browser_activity: str = "com.huawei.browser.BrowserActivity",
-        appium_server: str = "http://127.0.0.1:4723/wd/hub",
-    ):
+    def __init__(self, url: str = "https://node1.much-ai.com", headless: bool = False):
         self.url = url.rstrip("/")
         self.headless = headless
-        self.browser_package = browser_package
-        self.browser_activity = browser_activity
-        self.appium_server = appium_server
-
         self.driver = self._setup_driver()
         self.wait = WebDriverWait(
             self.driver, self.DEFAULT_TIMEOUT, poll_frequency=self.POLL_FREQUENCY
@@ -54,20 +46,20 @@ class FastRegistrationTester:
     # Driver helpers
     # ------------------------------------------------------------------
     def _setup_driver(self):
-        caps = {
-            "platformName": "Android",
-            "appium:automationName": "UiAutomator2",
-            "appium:deviceName": "Android",  # 名称随意
-            "appium:newCommandTimeout": 600,
-            # 指定包名 / Activity
-            "appium:appPackage": self.browser_package,
-            "appium:appActivity": self.browser_activity,
-            # 关闭图片，提速
-            "appium:chromeOptions": {"args": ["--blink-settings=imagesEnabled=false"]},
-            # 如果用 Chrome‑based 内核，可加 chromedriverExecutable 路径；省事可靠 Appium 自动下载
-        }
-        driver = webdriver.Remote(self.appium_server, caps)
-        driver.implicitly_wait(self.DEFAULT_TIMEOUT)
+        options = webdriver.ChromeOptions()
+        if self.headless:
+            options.add_argument("--headless=new")
+        # Faster, lighter‑weight browsing
+        options.add_argument("--disable-gpu")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--blink-settings=imagesEnabled=false")  # block images
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        options.add_experimental_option("useAutomationExtension", False)
+        options.page_load_strategy = "eager"  # don't wait for images/ads
+        driver = webdriver.Chrome(options=options)
+        driver.set_page_load_timeout(self.DEFAULT_TIMEOUT)
         return driver
 
     # ------------------------------------------------------------------
@@ -99,9 +91,20 @@ class FastRegistrationTester:
             self._close_notifications()
             self._go_to_register_tab()
             self._fill_form(data)
-            self._submit()
+
+            if self._wait_for_code_input():
+                self._submit()
+            else:
+                logging.error("Verification code not entered within %ss", self.CODE_INPUT_TIMEOUT)
+                return {
+                    "status": "timeout",
+                    "message": "验证码超时未输入",
+                    "url": self.driver.current_url,
+                }
+
             result = self._check_result()
         finally:
+            # Always capture evidence fast
             snap = f"reg_fast_{start.strftime('%Y%m%d_%H%M%S')}.png"
             try:
                 self.driver.save_screenshot(snap)
@@ -109,8 +112,9 @@ class FastRegistrationTester:
                 pass
             self.driver.quit()
 
-        result["duration"] = (datetime.now() - start).total_seconds()
-        logging.info("Finished in %.2fs", result["duration"])
+        duration = (datetime.now() - start).total_seconds()
+        result["duration"] = duration
+        logging.info("Finished in %.2fs", duration)
         return result
 
     # ------------------------------------------------------------------
@@ -132,35 +136,57 @@ class FastRegistrationTester:
             logging.debug("No notification pop‑up detected")
 
     def _go_to_register_tab(self):
-        self.wait.until(EC.element_to_be_clickable((By.XPATH, "//button[.//span[text()='登录']]"))).click()
-        self.wait.until(
+        login_btn = self.wait.until(
+            EC.element_to_be_clickable((By.XPATH, "//button[.//span[text()='登录']]"))
+        )
+        login_btn.click()
+        register_tab = self.wait.until(
             EC.element_to_be_clickable(
-                (By.XPATH, "//div[@id='tab-register' and contains(@class,'el-tabs__item')]")
+                (
+                    By.XPATH,
+                    "//div[@id='tab-register' and contains(@class,'el-tabs__item')]",
+                )
             )
-        ).click()
+        )
+        register_tab.click()
         logging.info("Switched to register tab")
 
     def _fill_form(self, data):
-        self.wait.until(EC.presence_of_element_located((By.ID, "register-phone"))).send_keys(data["email"])
-        self.wait.until(EC.element_to_be_clickable((By.XPATH, "//button[.//span[text()='发送验证码']]"))).click()
-        self.wait.until(EC.presence_of_element_located((By.ID, "register-password"))).send_keys(data["password"])
-        self.wait.until(EC.presence_of_element_located((By.ID, "register-confirm-password"))).send_keys(data["password"])
-        print("\n已发送验证码，请在网页输入 4 位数字验证码…\n")
-        self._wait_for_code()
+        # E‑mail / phone
+        self.wait.until(EC.presence_of_element_located((By.ID, "register-phone"))).send_keys(
+            data["email"]
+        )
+        # Send code
+        self.wait.until(
+            EC.element_to_be_clickable((By.XPATH, "//button[.//span[text()='发送验证码']]"))
+        ).click()
+        # Passwords
+        self.wait.until(EC.presence_of_element_located((By.ID, "register-password"))).send_keys(
+            data["password"]
+        )
+        self.wait.until(
+            EC.presence_of_element_located((By.ID, "register-confirm-password"))
+        ).send_keys(data["password"])
+        logging.info("Form filled – waiting for verification code input…")
 
-    def _wait_for_code(self):
-        start_time = time.time()
-        while True:
-            code_inputs = self.driver.find_elements(By.CSS_SELECTOR, "input[type='text']")
-            for inp in code_inputs:
-                if inp.is_displayed() and inp.get_attribute("id") != "register-phone":
-                    val = inp.get_attribute("value").strip()
-                    if len(val) == self.CODE_LEN and val.isdigit():
-                        logging.info("验证码检测到: %s", val)
-                        return
-            if time.time() - start_time > self.MAX_CODE_WAIT:
-                raise TimeoutException("等待验证码超时")
-            time.sleep(1)
+    def _wait_for_code_input(self) -> bool:
+        """Poll the verification‑code input every second until 4 digits are
+        entered or the timeout expires. Returns ``True`` when 4 digits are
+        detected, otherwise ``False``.
+        """
+        end_time = time.time() + self.CODE_INPUT_TIMEOUT
+        while time.time() < end_time:
+            try:
+                code_input = self.driver.find_element(By.ID, self.CODE_FIELD_ID)
+                value = (code_input.get_attribute("value") or "").strip()
+                if len(value) == 4 and value.isdigit():
+                    logging.info("Detected 4‑digit code: %s", value)
+                    return True
+            except Exception:
+                # Element not ready / transient – ignore and retry
+                pass
+            time.sleep(1)  # poll once per second
+        return False
 
     def _submit(self):
         self.wait.until(
@@ -174,20 +200,25 @@ class FastRegistrationTester:
         logging.info("Clicked register")
 
     def _check_result(self):
-        time.sleep(2)
+        time.sleep(2)  # short settle
         current_url = self.driver.current_url
         logging.info("Redirected to %s", current_url)
-        if any(k in current_url.lower() for k in ("success", "dashboard", "home", "welcome")):
-            return {"status": "success", "message": "注册成功", "url": current_url}
-        try:
-            toast = self.driver.find_element(By.CSS_SELECTOR, "div.el-message").text.strip()
-            status = "error" if toast else "unknown"
-            msg = toast or "无法确定注册结果"
-        except Exception:
-            status, msg = "unknown", "无法确定注册结果"
+        if any(k in current_url.lower() for k in ["success", "dashboard", "home", "welcome"]):
+            status = "success"
+            msg = "注册成功"
+        else:
+            # Try pick up toast message quickly (non‑blocking)
+            try:
+                toast = self.driver.find_element(By.CSS_SELECTOR, "div.el-message").text.strip()
+                status = "error" if toast else "unknown"
+                msg = toast or "无法确定注册结果"
+            except Exception:
+                status = "unknown"
+                msg = "无法确定注册结果"
         return {"status": status, "message": msg, "url": current_url}
 
 
 if __name__ == "__main__":
     tester = FastRegistrationTester(headless=False)
-    print("RESULT:", tester.run())
+    outcome = tester.run()
+    print("RESULT:", outcome)
